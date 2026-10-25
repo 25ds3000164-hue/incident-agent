@@ -27,10 +27,10 @@ from starlette.routing import Route
 PROFILE = "ga5-incident-agent/v2"
 MAX_BODY = 4 * 1024 * 1024
 MAX_RESPONSE = 768 * 1024
-PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET_SECONDS", "14"))
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET_SECONDS", "13"))
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 GEMINI_THINKING = int(os.environ.get("GEMINI_THINKING_BUDGET", "512"))
 DESTRUCTIVE_DEFAULT = ["rollback_deployment", "disable_feature"]
 TP_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
@@ -284,20 +284,36 @@ def planner_input(body):
             f"TRANSCRIPT:\n{inc['transcript']}")
 
 
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "minimal")
+PRIMARY_WAIT = float(os.environ.get("PRIMARY_WAIT_SECONDS", "8"))
+
+
+def thinking_options(model, budget):
+    """Gemini 3.x uses thinkingLevel; 2.x uses thinkingBudget. Fall back gracefully on 400."""
+    if model.startswith("gemini-3"):
+        opts = [{"thinkingLevel": GEMINI_THINKING_LEVEL}]
+        if GEMINI_THINKING_LEVEL != "low":
+            opts.append({"thinkingLevel": "low"})
+        return opts + [None]
+    return ([{"thinkingBudget": budget}] if budget is not None else []) + [None]
+
+
 async def call_gemini(model, prompt, schema, timeout, thinking):
     import httpx
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gen = {"responseMimeType": "application/json", "responseSchema": schema, "temperature": 0,
            "maxOutputTokens": 8192}
-    if thinking is not None:
-        gen["thinkingConfig"] = {"thinkingBudget": thinking}
     req = {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
            "contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": gen}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, json=req, headers={"x-goog-api-key": GEMINI_KEY})
-        if r.status_code == 400 and thinking is not None and "thinking" in r.text.lower():
-            gen.pop("thinkingConfig", None)
+        for opt in thinking_options(model, thinking):
+            if opt is None:
+                gen.pop("thinkingConfig", None)
+            else:
+                gen["thinkingConfig"] = opt
             r = await client.post(url, json=req, headers={"x-goog-api-key": GEMINI_KEY})
+            if not (r.status_code == 400 and "thinking" in r.text.lower()):
+                break
         r.raise_for_status()
         data = r.json()
     parts = data["candidates"][0]["content"]["parts"]
@@ -443,19 +459,48 @@ async def make_plan(body, deadline):
     prompt = planner_input(body)
     schema = plan_schema(body["incident"]["allowedRootCauses"])
     started = now_ns()
+    t0 = time.monotonic()
     model_used, raw, source = GEMINI_MODEL, None, "model"
     if GEMINI_KEY:
-        for model, thinking, cap in [(GEMINI_MODEL, GEMINI_THINKING, 10.0), (GEMINI_FALLBACK_MODEL, 0, 99.0)]:
-            remaining = deadline - time.monotonic()
-            if remaining < 2.5:
-                break
-            model_used = model
+        # Ask both models at once; prefer the primary if it answers within PRIMARY_WAIT.
+        async def attempt(model, thinking):
             try:
-                raw = await call_gemini(model, prompt, schema, timeout=min(cap, remaining - 1.0), thinking=thinking)
-                break
+                return await call_gemini(model, prompt, schema, timeout=max(1.0, deadline - time.monotonic() - 0.5),
+                                         thinking=thinking)
             except Exception as e:  # noqa: BLE001
-                print(f"[gemini] {model} failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                print(f"[gemini] {model} failed after {time.monotonic() - t0:.1f}s: "
+                      f"{type(e).__name__}: {str(e)[:200]}", flush=True)
+                return None
+        tasks = {GEMINI_MODEL: asyncio.create_task(attempt(GEMINI_MODEL, GEMINI_THINKING))}
+        if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+            tasks[GEMINI_FALLBACK_MODEL] = asyncio.create_task(attempt(GEMINI_FALLBACK_MODEL, 0))
+        order = list(tasks)
+        try:
+            prim = tasks[order[0]]
+            await asyncio.wait({prim}, timeout=max(0.5, min(PRIMARY_WAIT, deadline - time.monotonic())))
+            if prim.done() and prim.result() is not None:
+                raw, model_used = prim.result(), order[0]
+            else:
+                pending = {t for t in tasks.values() if not t.done()}
+                while raw is None:
+                    for name in order:
+                        t = tasks[name]
+                        if t.done() and t.result() is not None:
+                            raw, model_used = t.result(), name
+                            break
+                    if raw is not None or not pending:
+                        break
+                    done, pending = await asyncio.wait(pending, timeout=max(0.1, deadline - time.monotonic()),
+                                                       return_when=asyncio.FIRST_COMPLETED)
+                    if not done:
+                        break
+        finally:
+            for t in tasks.values():
+                if not t.done():
+                    t.cancel()
     ended = now_ns()
+    print(f"[plan] run={sha(body['runId'])[:8]} model={model_used if raw is not None else '-'} "
+          f"ok={raw is not None} {time.monotonic() - t0:.1f}s", flush=True)
     if raw is not None:
         plan = normalize_plan(raw, body)
         cache_stmt = ("INSERT INTO inc_plan_cache (key, plan) VALUES (?,?) ON CONFLICT (key) DO UPDATE "
